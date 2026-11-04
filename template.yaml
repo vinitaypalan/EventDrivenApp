@@ -50,7 +50,6 @@ Resources:
   SNSDeliveryStatusLoggingRole:
     Type: AWS::IAM::Role
     Properties:
-      PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/EventDrivenAppLambdaBoundary
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
