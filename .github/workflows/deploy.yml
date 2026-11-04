@@ -1,0 +1,47 @@
+name: Deploy SAM application
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  SAM_STACK_NAME: event-driven-app
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActionsSAMDeploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Build SAM application
+        run: sam build --template-file template.yaml
+
+      - name: Deploy SAM application
+        run: >
+          sam deploy
+          --template-file .aws-sam/build/template.yaml
+          --stack-name "$SAM_STACK_NAME"
+          --s3-bucket aws-sam-cli-managed-default-samclisourcebucket-hskqhnyaripv
+          --role-arn arn:aws:iam::525391386782:role/EventDrivenAppCloudFormationExecutionRole
+          --region "$AWS_REGION"
+          --capabilities CAPABILITY_IAM
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset

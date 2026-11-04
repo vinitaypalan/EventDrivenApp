@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless application using an existing orders table
+
+Globals:
+  Function:
+    PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/EventDrivenAppLambdaBoundary
+
+Parameters:
+  OrdersTableName:
+    Type: String
+    Default: Orders
+    Description: Name of the existing DynamoDB orders table
+
+Resources:
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: OrdersEventBus
+
+  OrderNotificationsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the OrderNotificationsTopic SNS messages
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowEventBridgeToEncryptTopicMessages
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+
+  OrderNotificationsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/OrderNotificationsTopic
+      TargetKeyId: !Ref OrderNotificationsKey
+
+  SNSDeliveryStatusLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/EventDrivenAppLambdaBoundary
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:OrderNotificationsTopic
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: WriteSNSDeliveryStatusLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sns/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sns/*:log-stream:*
+
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OrderNotificationsTopic
+      KmsMasterKeyId: !GetAtt OrderNotificationsKey.Arn
+      DeliveryStatusLogging:
+        - Protocol: lambda
+          FailureFeedbackRoleArn: !GetAtt SNSDeliveryStatusLoggingRole.Arn
+          SuccessFeedbackRoleArn: !GetAtt SNSDeliveryStatusLoggingRole.Arn
+          SuccessFeedbackSampleRate: '100'
+        - Protocol: sqs
+          FailureFeedbackRoleArn: !GetAtt SNSDeliveryStatusLoggingRole.Arn
+          SuccessFeedbackRoleArn: !GetAtt SNSDeliveryStatusLoggingRole.Arn
+          SuccessFeedbackSampleRate: '100'
+
+  OrderNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OrderNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  OrderProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderProcessingDLQ
+
+  OrderProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderProcessingQueue
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderProcessingDLQ.Arn
+        maxReceiveCount: 5
+
+  OrderEventDeliveryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderEventDeliveryDLQ
+
+  OrderCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source:
+          - orders.service
+        detail-type:
+          - OrderCreated
+      Targets:
+        - Id: OrderNotificationFunctionTarget
+          Arn: !GetAtt OrderNotificationFunction.Arn
+        - Id: OrderProcessingQueueTarget
+          Arn: !GetAtt OrderProcessingQueue.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt OrderEventDeliveryDLQ.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 10
+        - Id: OrderNotificationsTopicTarget
+          Arn: !Ref OrderNotificationsTopic
+          DeadLetterConfig:
+            Arn: !GetAtt OrderEventDeliveryDLQ.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 10
+
+  OrderProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  OrderEventDeliveryDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderEventDeliveryDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderEventDeliveryDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  OrderNotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/order-notification/
+      Handler: index.handler
+      Runtime: nodejs22.x
+
+  ProcessOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/process-order/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 30
+      Tracing: Active
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:ChangeMessageVisibility
+              Resource: !GetAtt OrderProcessingQueue.Arn
+      Events:
+        ProcessOrderMessages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderProcessingQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  OrderCreatedRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrderNotificationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrderCreatedRule.Arn
+
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: EventDrivenOrdersApi
+      StageName: Prod
+
+  EventDrivenOrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: EventDrivenOrdersDashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Orders API requests and client errors",
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "EventDrivenOrdersApi", "Stage", "Prod", { "stat": "SampleCount", "label": "Requests" } ],
+                  [ ".", "4XXError", ".", ".", ".", ".", { "stat": "Sum", "label": "4XX errors" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Order Lambda invocations and errors",
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${CreateOrderFunction}", { "stat": "Sum", "label": "CreateOrderFunction invocations" } ],
+                  [ ".", "Errors", ".", ".", { "stat": "Sum", "label": "CreateOrderFunction errors" } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProcessOrderFunction}", { "stat": "Sum", "label": "ProcessOrderFunction invocations" } ],
+                  [ ".", "Errors", ".", ".", { "stat": "Sum", "label": "ProcessOrderFunction errors" } ]
+                ]
+              }
+            }
+          ]
+        }
+
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/save-order/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Tracing: Active
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTableName
+          ORDERS_EVENT_BUS: !Ref OrdersEventBus
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !GetAtt OrdersEventBus.Arn
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrdersApi
+            Path: /orders
+            Method: post
+
+Outputs:
+  OrdersApiUrl:
+    Description: Invoke URL for the orders REST API
+    Value: !Sub https://${OrdersApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/
+  OrdersEventBusName:
+    Description: Name of the orders EventBridge event bus
+    Value: !Ref OrdersEventBus
+  OrderProcessingQueueUrl:
+    Description: URL of the order-processing SQS queue
+    Value: !Ref OrderProcessingQueue
+  OrderProcessingQueueArn:
+    Description: ARN of the order-processing SQS queue
+    Value: !GetAtt OrderProcessingQueue.Arn
+  OrderProcessingDLQUrl:
+    Description: URL of the order-processing dead-letter queue
+    Value: !Ref OrderProcessingDLQ
+  OrderProcessingDLQArn:
+    Description: ARN of the order-processing dead-letter queue
+    Value: !GetAtt OrderProcessingDLQ.Arn
+  OrderEventDeliveryDLQUrl:
+    Description: URL of the EventBridge target delivery dead-letter queue
+    Value: !Ref OrderEventDeliveryDLQ
+  OrderEventDeliveryDLQArn:
+    Description: ARN of the EventBridge target delivery dead-letter queue
+    Value: !GetAtt OrderEventDeliveryDLQ.Arn
+  CreateOrderFunctionName:
+    Description: Name of the order-creation Lambda function
+    Value: !Ref CreateOrderFunction
+  ProcessOrderFunctionName:
+    Description: Name of the order-processing Lambda function
+    Value: !Ref ProcessOrderFunction
+  OrderNotificationFunctionName:
+    Description: Name of the order-notification Lambda function
+    Value: !Ref OrderNotificationFunction
+  OrderNotificationsTopicArn:
+    Description: ARN of the order notifications SNS topic
+    Value: !Ref OrderNotificationsTopic
+  OrderNotificationsTopicName:
+    Description: Name of the order notifications SNS topic
+    Value: !GetAtt OrderNotificationsTopic.TopicName
+  EventDrivenOrdersDashboardName:
+    Description: Name of the CloudWatch dashboard for the orders application
+    Value: !Ref EventDrivenOrdersDashboard
