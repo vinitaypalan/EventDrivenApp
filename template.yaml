@@ -107,7 +107,7 @@ Resources:
             Resource: !Ref OrderNotificationsTopic
             Condition:
               ArnEquals:
-                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+                aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderCreatedRule
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
@@ -133,6 +133,7 @@ Resources:
   OrderCreatedRule:
     Type: AWS::Events::Rule
     Properties:
+      Name: OrderCreatedRule
       EventBusName: !Ref OrdersEventBus
       EventPattern:
         source:
@@ -172,7 +173,7 @@ Resources:
             Resource: !GetAtt OrderProcessingQueue.Arn
             Condition:
               ArnEquals:
-                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+                aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderCreatedRule
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
@@ -191,7 +192,7 @@ Resources:
             Resource: !GetAtt OrderEventDeliveryDLQ.Arn
             Condition:
               ArnEquals:
-                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+                aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderCreatedRule
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
@@ -234,7 +235,7 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref OrderNotificationFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt OrderCreatedRule.Arn
+      SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderCreatedRule
 
   OrdersApi:
     Type: AWS::Serverless::Api
