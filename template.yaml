@@ -11,12 +11,41 @@ Parameters:
     Type: String
     Default: Orders
     Description: Name of the existing DynamoDB orders table
+  SecondaryEventBusRegion:
+    Type: String
+    Default: ''
+    Description: Optional secondary region for an EventBridge global endpoint configuration.
+  SecondaryEventBusName:
+    Type: String
+    Default: OrdersEventBus
+    Description: Optional secondary event bus name for a multi-region EventBridge global endpoint.
+
+Conditions:
+  HasGlobalEndpointConfiguration: !And
+    - !Not [!Equals [!Ref SecondaryEventBusRegion, '']]
+    - !Not [!Equals [!Ref SecondaryEventBusName, '']]
 
 Resources:
   OrdersEventBus:
     Type: AWS::Events::EventBus
     Properties:
       Name: OrdersEventBus
+
+  OrdersEventBusGlobalEndpoint:
+    Condition: HasGlobalEndpointConfiguration
+    Type: AWS::Events::Endpoint
+    Properties:
+      Name: OrdersEventBusGlobalEndpoint
+      Description: Global endpoint for the OrdersEventBus
+      EventBuses:
+        - EventBusArn: !GetAtt OrdersEventBus.Arn
+        - EventBusArn: !Sub arn:${AWS::Partition}:events:${SecondaryEventBusRegion}:${AWS::AccountId}:event-bus/${SecondaryEventBusName}
+      RoutingConfig:
+        FailoverConfig:
+          Primary:
+            HealthCheck: !Sub arn:${AWS::Partition}:route53:::healthcheck/${AWS::StackName}-orders-primary
+          Secondary:
+            Route: !Ref SecondaryEventBusRegion
 
   OrderNotificationsKey:
     Type: AWS::KMS::Key
@@ -100,7 +129,8 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
+          - Sid: AllowOrderCreatedRule
+            Effect: Allow
             Principal:
               Service: events.amazonaws.com
             Action: sns:Publish
@@ -110,6 +140,81 @@ Resources:
                 aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderCreatedRule
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowOrderProcessedRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderProcessedRule
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  EventDrivenAppIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EventDrivenAppIdempotencyTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  EventDrivenAppOrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: EventDrivenAppOrderDLQ
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:EventDrivenAppOrderQueue
+
+  EventDrivenAppOrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: EventDrivenAppOrderQueue
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 180
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventDrivenAppOrderDLQ.Arn
+        maxReceiveCount: 3
+
+  ApiGatewaySqsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-ApiGatewaySqsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:*/*/POST/orders
+      Policies:
+        - PolicyName: SendOrdersToQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt EventDrivenAppOrderQueue.Arn
 
   OrderProcessingDLQ:
     Type: AWS::SQS::Queue
@@ -150,6 +255,27 @@ Resources:
           RetryPolicy:
             MaximumEventAgeInSeconds: 3600
             MaximumRetryAttempts: 10
+        - Id: OrderNotificationsTopicTarget
+          Arn: !Ref OrderNotificationsTopic
+          DeadLetterConfig:
+            Arn: !GetAtt OrderEventDeliveryDLQ.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 10
+
+  OrderProcessedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: OrderProcessedRule
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source:
+          - orders.processing
+        detail-type:
+          - OrderProcessed
+      Targets:
+        - Id: OrderNotificationFunctionTarget
+          Arn: !GetAtt OrderNotificationFunction.Arn
         - Id: OrderNotificationsTopicTarget
           Arn: !Ref OrderNotificationsTopic
           DeadLetterConfig:
@@ -211,6 +337,12 @@ Resources:
       Runtime: nodejs22.x
       Timeout: 30
       Tracing: Active
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTableName
+          IDEMPOTENCY_TABLE: !Ref EventDrivenAppIdempotencyTable
+          ORDERS_EVENT_BUS: !Ref OrdersEventBus
+          ORDERS_EVENT_ENDPOINT: !If [HasGlobalEndpointConfiguration, !Ref OrdersEventBusGlobalEndpoint, !Ref AWS::NoValue]
       Policies:
         - Statement:
             - Effect: Allow
@@ -219,12 +351,36 @@ Resources:
                 - sqs:DeleteMessage
                 - sqs:GetQueueAttributes
                 - sqs:ChangeMessageVisibility
-              Resource: !GetAtt OrderProcessingQueue.Arn
+              Resource:
+                - !GetAtt OrderProcessingQueue.Arn
+                - !GetAtt EventDrivenAppOrderQueue.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}
+                - !GetAtt EventDrivenAppIdempotencyTable.Arn
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource:
+                - !GetAtt OrdersEventBus.Arn
+                - !If [HasGlobalEndpointConfiguration, !GetAtt OrdersEventBusGlobalEndpoint.Arn, !Ref AWS::NoValue]
       Events:
         ProcessOrderMessages:
           Type: SQS
           Properties:
             Queue: !GetAtt OrderProcessingQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+        ProcessApiOrderMessages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventDrivenAppOrderQueue.Arn
             BatchSize: 10
             FunctionResponseTypes:
               - ReportBatchItemFailures
@@ -237,11 +393,93 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderCreatedRule
 
+  OrderProcessedRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrderNotificationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersEventBus}/OrderProcessedRule
+
   OrdersApi:
     Type: AWS::Serverless::Api
     Properties:
       Name: EventDrivenOrdersApi
       StageName: Prod
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: EventDrivenOrdersApi
+          version: '1.0'
+        schemes:
+          - https
+        consumes:
+          - application/json
+        produces:
+          - application/json
+        x-amazon-apigateway-request-validators:
+          validate_body_and_params:
+            validateRequestBody: true
+            validateRequestParameters: true
+        paths:
+          /orders:
+            post:
+              parameters:
+                - name: Idempotency-Key
+                  in: header
+                  required: true
+                  type: string
+                  pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+                - name: body
+                  in: body
+                  required: true
+                  schema:
+                    $ref: '#/definitions/OrderRequest'
+              x-amazon-apigateway-request-validator: validate_body_and_params
+              responses:
+                '202':
+                  description: Order accepted for asynchronous processing
+                '400':
+                  description: Invalid order or idempotency key
+                '500':
+                  description: Order could not be accepted
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${EventDrivenAppOrderQueue.QueueName}
+                credentials: !GetAtt ApiGatewaySqsRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: '#set($key = $input.params(''Idempotency-Key''))#set($request = "Action=InvalidIdempotencyKey")#if($key.matches("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))#set($encodedBody = $util.urlEncode($input.body))#set($encodedKey = $util.urlEncode($key))#set($request = "Action=SendMessage&MessageBody=$encodedBody&MessageAttribute.1.Name=IdempotencyKey&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=$encodedKey")#end$request'
+                responses:
+                  '4\d{2}':
+                    statusCode: '400'
+                    responseTemplates:
+                      application/json: '{"message":"Invalid or rejected order request"}'
+                  '5\d{2}':
+                    statusCode: '500'
+                    responseTemplates:
+                      application/json: '{"message":"Order could not be accepted"}'
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: '{"message":"Order accepted for processing"}'
+        definitions:
+          OrderRequest:
+            type: object
+            required:
+              - orderId
+              - itemId
+            properties:
+              orderId:
+                type: string
+                minLength: 1
+              itemId:
+                type: string
+                minLength: 1
+            additionalProperties: true
 
   EventDrivenOrdersDashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -287,9 +525,45 @@ Resources:
                   [ ".", "Errors", ".", ".", { "stat": "Sum", "label": "ProcessOrderFunction errors" } ]
                 ]
               }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Asynchronous order queue and DLQ depth",
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${EventDrivenAppOrderQueue.QueueName}", { "stat": "Maximum", "label": "Orders waiting" } ],
+                  [ ".", ".", ".", "${EventDrivenAppOrderDLQ.QueueName}", { "stat": "Maximum", "label": "Orders in DLQ" } ]
+                ]
+              }
             }
           ]
         }
+
+  EventDrivenAppOrderDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EventDrivenAppOrderDLQMessagesVisible
+      AlarmDescription: Alarm when one or more failed order messages are visible in the order DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDrivenAppOrderDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
 
   CreateOrderFunction:
     Type: AWS::Serverless::Function
@@ -302,6 +576,7 @@ Resources:
         Variables:
           ORDERS_TABLE: !Ref OrdersTableName
           ORDERS_EVENT_BUS: !Ref OrdersEventBus
+          ORDERS_EVENT_ENDPOINT: !If [HasGlobalEndpointConfiguration, !Ref OrdersEventBusGlobalEndpoint, !Ref AWS::NoValue]
       Policies:
         - Statement:
             - Effect: Allow
@@ -311,14 +586,9 @@ Resources:
             - Effect: Allow
               Action:
                 - events:PutEvents
-              Resource: !GetAtt OrdersEventBus.Arn
-      Events:
-        CreateOrder:
-          Type: Api
-          Properties:
-            RestApiId: !Ref OrdersApi
-            Path: /orders
-            Method: post
+              Resource:
+                - !GetAtt OrdersEventBus.Arn
+                - !If [HasGlobalEndpointConfiguration, !GetAtt OrdersEventBusGlobalEndpoint.Arn, !Ref AWS::NoValue]
 
 Outputs:
   OrdersApiUrl:
@@ -327,6 +597,12 @@ Outputs:
   OrdersEventBusName:
     Description: Name of the orders EventBridge event bus
     Value: !Ref OrdersEventBus
+  OrdersEventBusGlobalEndpointName:
+    Description: Global endpoint name for the orders EventBridge event bus when configured
+    Value: !If [HasGlobalEndpointConfiguration, !Ref OrdersEventBusGlobalEndpoint, 'not-configured']
+  OrdersEventBusGlobalEndpointArn:
+    Description: ARN of the orders EventBridge global endpoint when configured
+    Value: !If [HasGlobalEndpointConfiguration, !GetAtt OrdersEventBusGlobalEndpoint.Arn, 'not-configured']
   OrderProcessingQueueUrl:
     Description: URL of the order-processing SQS queue
     Value: !Ref OrderProcessingQueue
@@ -339,6 +615,24 @@ Outputs:
   OrderProcessingDLQArn:
     Description: ARN of the order-processing dead-letter queue
     Value: !GetAtt OrderProcessingDLQ.Arn
+  EventDrivenAppOrderQueueUrl:
+    Description: URL of the API ingress order queue
+    Value: !Ref EventDrivenAppOrderQueue
+  EventDrivenAppOrderQueueArn:
+    Description: ARN of the API ingress order queue
+    Value: !GetAtt EventDrivenAppOrderQueue.Arn
+  EventDrivenAppOrderDLQUrl:
+    Description: URL of the API ingress order dead-letter queue
+    Value: !Ref EventDrivenAppOrderDLQ
+  EventDrivenAppOrderDLQArn:
+    Description: ARN of the API ingress order dead-letter queue
+    Value: !GetAtt EventDrivenAppOrderDLQ.Arn
+  EventDrivenAppOrderDLQAlarmName:
+    Description: CloudWatch alarm for visible messages in the API ingress order DLQ
+    Value: !Ref EventDrivenAppOrderDLQAlarm
+  EventDrivenAppIdempotencyTableName:
+    Description: Name of the order idempotency table
+    Value: !Ref EventDrivenAppIdempotencyTable
   OrderEventDeliveryDLQUrl:
     Description: URL of the EventBridge target delivery dead-letter queue
     Value: !Ref OrderEventDeliveryDLQ

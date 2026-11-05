@@ -35,19 +35,22 @@ exports.handler = async (event) => {
   );
 
   try {
+    const endpointEvent = {
+      Source: "orders.service",
+      DetailType: "OrderCreated",
+      Detail: JSON.stringify({
+        orderId: order.orderId,
+        itemId: order.itemId,
+        order,
+      }),
+    };
+
     const result = await eventBridge.send(
       new PutEventsCommand({
         Entries: [
-          {
-            EventBusName: process.env.ORDERS_EVENT_BUS,
-            Source: "orders.service",
-            DetailType: "OrderCreated",
-            Detail: JSON.stringify({
-              orderId: order.orderId,
-              itemId: order.itemId,
-              order,
-            }),
-          },
+          process.env.ORDERS_EVENT_ENDPOINT
+            ? { EndpointId: process.env.ORDERS_EVENT_ENDPOINT, ...endpointEvent }
+            : { EventBusName: process.env.ORDERS_EVENT_BUS, ...endpointEvent },
         ],
       }),
     );
