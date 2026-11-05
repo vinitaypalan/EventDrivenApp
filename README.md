@@ -129,7 +129,3 @@ sam deploy --guided
 Provide the stack name, region, and deployment bucket. The stack creates IAM resources, including a named role, so approve the IAM capabilities requested by SAM (including `CAPABILITY_NAMED_IAM`).
 
 Pushing to `main` triggers the GitHub Actions workflow. Before using it, configure the `AWS_ROLE_TO_ASSUME` repository secret and its AWS OIDC trust relationship. The workflow currently uses a fixed region, stack name, deployment bucket, and CloudFormation execution role in `.github/workflows/deploy.yml`; update those values for your AWS environment.
-
-## Inspect and redrive failed messages
-
-Check the `EventDrivenAppOrderDLQMessagesVisible` CloudWatch alarm and inspect `EventDrivenAppOrderDLQ` in the SQS console or with the AWS CLI. Correct the underlying issue before redriving messages to `EventDrivenAppOrderQueue`. Keep the original idempotency key so already-completed requests can be recognized safely.
